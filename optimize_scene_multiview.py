@@ -1,5 +1,6 @@
 import json
 import math
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,7 @@ from misc import SceneObject, CameraParams
 from model import ShapeEmbedding, SceneSDF, NeuralParts, VisionModel, MultiViewTransformer
 from dataset import MultiViewDataset, multiview_collate
 from losses import color_histogram_loss
+from utils import CSVLogger
 from tqdm import tqdm
 from PIL import Image
 
@@ -133,6 +135,12 @@ def main():
     n_views = len(cams)
     tan_hf  = math.tan(math.radians(renderer.fov_deg / 2))
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logger = CSVLogger(
+        f"logs/optimize_scene_multiview_{timestamp}.csv",
+        columns=["epoch", "recon", "vision", "commit", "frustum", "intersec", "connect", "mask", "hist", "scale"],
+    )
+
     for epoch in tqdm(range(EPOCHS)):
         optim.zero_grad()
         log = dict(recon=0.0, vision=0.0, commit=0.0, frustum=0.0, intersec=0.0, connect=0.0, mask=0.0, hist=0.0)
@@ -215,6 +223,8 @@ def main():
         obj_codes = [codes[i] for i in nearest_idx.tolist()]
         save_scene_ply(quant_objs, scale, obj_codes, MESH_FOLDER, "output_scene.ply")
         optim.step()
+        logger.write([epoch, log["recon"], log["vision"], log["commit"], log["frustum"],
+                      log["intersec"], log["connect"], log["mask"], log["hist"], last_scale.item()])
         print(f"\nrec: {log['recon']:.4f} | vision: {log['vision']:.4f} | commit: {log['commit']:.4f} | frustum: {log['frustum']:.4f} | intersec: {log['intersec']:.4f} | connect: {log['connect']:.4f} | mask: {log['mask']:.4f} | hist: {log['hist']:.4f}\nscale: {last_scale.item()}")
         Image.fromarray(first_view_pixels).save(f"iterations/{epoch:04d}.png")
 

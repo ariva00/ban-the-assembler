@@ -1,6 +1,7 @@
 import itertools
 import math
 import random
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,7 @@ from model import ShapeEmbedding, NeuralParts, SceneSDF, VisionModel, MultiViewT
 from renderer import SDFRenderer
 from misc import SceneObject, CameraParams
 from dataset import MeshSDFDataset
+from utils import CSVLogger
 from tqdm import tqdm
 
 # ── Hyper-parameters ──────────────────────────────────────────────────────────
@@ -151,6 +153,12 @@ def train_vision_multiview():
 
     codes = saved_dict["codes"]
 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logger = CSVLogger(
+        f"logs/pretrain_vision_multiview_{timestamp}.csv",
+        columns=["epoch", "loss", "dense", "obj", "scale"],
+    )
+
     def sample_scene_losses():
         """One random scene, rendered from N_VIEWS_MULTIVIEW cameras. Returns
         (dense_loss, obj_loss, scale_loss), not yet backward()'d, so the caller
@@ -224,8 +232,10 @@ def train_vision_multiview():
 
         optimizer.step()
 
+        loss_total = dense_total + obj_total + 0.1 * scale_total
+        logger.write([epoch, loss_total, dense_total, obj_total, scale_total])
+
         if epoch % 10 == 0:
-            loss_total = dense_total + obj_total + 0.1 * scale_total
             print(f"Epoch {epoch:4d}/{EPOCHS_VISION_MULTIVIEW}  loss={loss_total:.6f}  "
                   f"dense={dense_total:.6f}  obj={obj_total:.6f}  scale={scale_total:.6f}")
 
