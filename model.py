@@ -160,6 +160,15 @@ class Scene(nn.Module):
             "scale"   : F.softplus(self.scale),            # always positive
         }
 
+def _group_norm(channels: int) -> torch.nn.GroupNorm:
+    """Largest divisor of `channels` that's <= 8, so GroupNorm always gets a
+    valid, reasonably-sized number of groups regardless of the channel count
+    at a given layer (channel counts here are powers of two, so this lands on
+    8 almost everywhere, but stays correct even if hidden_dim/n_layers change)."""
+    groups = next(g for g in (8, 4, 2, 1) if channels % g == 0)
+    return torch.nn.GroupNorm(groups, channels)
+
+
 class VisionModel(nn.Module):
     def __init__(self, input_dim: int = 3, output_dim: int = 123, hidden_dim: int = 512, n_layers: int = 4):
         assert hidden_dim % (2**n_layers) == 0, "hidden_dim must be divisible by 2^n_layers"
@@ -168,32 +177,46 @@ class VisionModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
         self.input_conv = torch.nn.Conv2d(3, step, kernel_size=3, padding=1)
+        self.input_norm = _group_norm(step)
         self.output_conv = torch.nn.Conv2d(max(step * 2, output_dim), output_dim, kernel_size=1)
         conv_down = []
+        norm_down = []
         conv_up   = []
+        norm_up   = []
         for i in range(n_layers):
             conv_down.append(torch.nn.Conv2d(step * (2 ** i), step * (2 ** (i+1)), 3, padding=1))
             conv_down.append(torch.nn.Conv2d(step * (2 ** (i+1)), step * (2 ** (i+1)), 3, padding=1))
             conv_down.append(torch.nn.Conv2d(step * (2 ** (i+1)), step * (2 ** (i+1)), 3, padding=1))
+            norm_down += [_group_norm(step * (2 ** (i+1)))] * 3
             if i > 0:
                 in_ch  = step * (2**(n_layers + 1 - i))
                 out_ch = step * (2**(n_layers - i))
-                conv_up.append(torch.nn.ConvTranspose2d(max(in_ch, output_dim), max(out_ch, output_dim), kernel_size=2, stride=2))
-                conv_up.append(torch.nn.Conv2d(max(2 * out_ch, out_ch + output_dim), max(out_ch, output_dim), kernel_size=3, padding=1))
-                conv_up.append(torch.nn.Conv2d(max(out_ch, output_dim), max(out_ch, output_dim), kernel_size=3, padding=1))
+                up_in, up_out = max(in_ch, output_dim), max(out_ch, output_dim)
+                conv_up.append(torch.nn.ConvTranspose2d(up_in, up_out, kernel_size=2, stride=2))
+                conv_up.append(torch.nn.Conv2d(max(2 * out_ch, out_ch + output_dim), up_out, kernel_size=3, padding=1))
+                conv_up.append(torch.nn.Conv2d(up_out, up_out, kernel_size=3, padding=1))
+                norm_up += [_group_norm(up_out)] * 3
         self.conv_down = torch.nn.ModuleList(conv_down)
+        self.norm_down = torch.nn.ModuleList(norm_down)
         self.conv_up   = torch.nn.ModuleList(conv_up)
+        self.norm_up   = torch.nn.ModuleList(norm_up)
 
     def forward(self, x: torch.Tensor):
         B, H, W, C = x.shape
         x= x.transpose(-1,-2).transpose(-2, -3)
         x = F.adaptive_avg_pool2d(x, (self.hidden_dim, self.hidden_dim))
-        x = self.input_conv(x)
+        # Conv -> GroupNorm -> ReLU throughout (except output_conv, which stays a
+        # raw linear projection to the regression targets). VisionModel is a ~21
+        # conv layer encoder-decoder trained from scratch with no normalization
+        # at all previously -- a well-known recipe for training to stall early,
+        # which matched what the pretraining logs showed (dense_loss, a plain
+        # unambiguous per-pixel regression, plateaued almost immediately).
+        x = self.input_norm(self.input_conv(x)).relu()
         conv_down_outs = []
         for i in range(self.n_layers):
-            x = self.conv_down[(3 * i)](x).relu()
-            x = self.conv_down[(3 * i) + 1](x).relu()
-            x = self.conv_down[(3 * i) + 2](x).relu()
+            x = self.norm_down[(3 * i)](self.conv_down[(3 * i)](x)).relu()
+            x = self.norm_down[(3 * i) + 1](self.conv_down[(3 * i) + 1](x)).relu()
+            x = self.norm_down[(3 * i) + 2](self.conv_down[(3 * i) + 2](x)).relu()
             conv_down_outs.append(x)
             if i < self.n_layers - 1:
                 x = F.max_pool2d(x, kernel_size=2)
@@ -202,9 +225,9 @@ class VisionModel(nn.Module):
         signature = F.adaptive_avg_pool2d(bottleneck, 1).flatten(1)
 
         for i in range(self.n_layers - 1):
-            x = self.conv_up[(3 * i)](x)
-            x = self.conv_up[(3 * i) + 1](torch.cat((conv_down_outs[self.n_layers - 2 - i], x), dim=-3)).relu()
-            x = self.conv_up[(3 * i) + 2](x).relu()
+            x = self.norm_up[(3 * i)](self.conv_up[(3 * i)](x)).relu()
+            x = self.norm_up[(3 * i) + 1](self.conv_up[(3 * i) + 1](torch.cat((conv_down_outs[self.n_layers - 2 - i], x), dim=-3))).relu()
+            x = self.norm_up[(3 * i) + 2](self.conv_up[(3 * i) + 2](x)).relu()
 
         x = self.output_conv(x)
         x = F.adaptive_avg_pool2d(x, (H, W))

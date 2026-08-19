@@ -2,10 +2,13 @@ import torch
 from dataclasses import dataclass, field
 
 def _rotvec_to_matrix(r: torch.Tensor) -> torch.Tensor:
-    """Axis-angle vector (3,) → rotation matrix (3,3) via matrix exponential."""
-    x, y, z = r[0], r[1], r[2]
-    O = torch.zeros((), device=r.device, dtype=r.dtype)
-    skew = torch.stack([O, -z, y, z, O, -x, -y, x, O]).reshape(3, 3)
+    """Axis-angle vector(s) (..., 3) → rotation matrix/matrices (..., 3, 3) via
+    matrix exponential. Shape-agnostic (works for a single (3,) vector or any
+    batch of them, e.g. (V, H, W, 3)) since torch.linalg.matrix_exp batches
+    over all leading dims on its own."""
+    x, y, z = r[..., 0], r[..., 1], r[..., 2]
+    O = torch.zeros_like(x)
+    skew = torch.stack([O, -z, y, z, O, -x, -y, x, O], dim=-1).reshape(*r.shape[:-1], 3, 3)
     return torch.linalg.matrix_exp(skew)
 
 

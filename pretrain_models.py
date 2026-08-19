@@ -12,6 +12,7 @@ from model import ShapeEmbedding, NeuralParts, SceneSDF, VisionModel, MultiViewT
 from renderer import SDFRenderer
 from misc import SceneObject, CameraParams
 from dataset import MeshSDFDataset
+from losses import scene_attribute_loss
 from utils import CSVLogger
 from tqdm import tqdm
 
@@ -27,7 +28,7 @@ LR_LATENT    = 1e-3
 LR_VISION_MODEL    = 1e-3
 LR_MULTIVIEW_TRANSFORMER = 1e-3
 EPOCHS       = 1000
-EPOCHS_VISION_MULTIVIEW = 500   # epoch count for train_vision_multiview()
+EPOCHS_VISION_MULTIVIEW = 3   # epoch count for train_vision_multiview()
 SCENES_PER_STEP = 4   # independent scenes averaged into one gradient step
 CLAMP_DIST   = 0.1
 LATENT_REG   = 1e-4
@@ -167,7 +168,7 @@ def train_vision_multiview():
         with torch.no_grad():
             gt_objs = []
             for i in range(n_obj):
-                embedding = shape_emb[codes[i % len(codes)]].detach()
+                embedding = shape_emb[codes[torch.randint(0, len(codes), (1,)).item()]].detach()
                 translation = (torch.rand(3, device=DEVICE) * 2 - 1)
                 rot_vec = (torch.rand(3, device=DEVICE) * 2 - 1) * math.pi
                 color = torch.rand(3, device=DEVICE)
@@ -189,7 +190,7 @@ def train_vision_multiview():
             torch.stack([o.flatten() for o in gt_objs]),
             torch.zeros_like(gt_objs[0].flatten()).unsqueeze(0),
         ])   # (n_obj + 1, D)
-        dense_loss = F.mse_loss(pred_dense, flat_targets[segs])
+        dense_loss = scene_attribute_loss(pred_dense, flat_targets[segs], LATENT_DIM)
 
         # ── multiview_transformer: predict objects+scale from image_embs ────────
         seeds = [SceneObject.inflate(torch.randn(LATENT_DIM + 9, device=DEVICE)) for _ in range(n_obj)]
@@ -212,7 +213,7 @@ def train_vision_multiview():
 
         matched_gt_flat = gt_flat[list(best_perm)]
 
-        obj_loss   = F.mse_loss(pred_flat, matched_gt_flat)
+        obj_loss   = scene_attribute_loss(pred_flat, matched_gt_flat, LATENT_DIM)
         scale_loss = F.mse_loss(pred_scale, scale_gt.reshape(pred_scale.shape))
 
         return dense_loss, obj_loss, scale_loss

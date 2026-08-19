@@ -1,4 +1,49 @@
 import torch
+import torch.nn.functional as F
+
+from misc import _rotvec_to_matrix
+
+
+def scene_attribute_loss(
+    pred_flat:   torch.Tensor,   # (..., latent_dim + 9): [embedding | translation | rot_vec | color]
+    target_flat: torch.Tensor,   # same shape/layout as pred_flat
+    latent_dim:  int,
+    weights:     dict[str, float] | None = None,
+) -> torch.Tensor:
+    """
+    MSE between two flattened SceneObject vectors (any leading batch shape,
+    e.g. (n_obj, D) or (V, H, W, D) for a dense per-pixel prediction), split
+    into embedding/translation/rotation/color and each averaged separately
+    before combining -- a single flat MSE over the concatenated vector lets
+    whichever component has the largest natural scale dominate the gradient
+    and starve the others.
+
+    Rotation specifically is compared as rotation matrices, not raw rot_vec
+    components: axis-angle MSE is discontinuous at the angle-pi wraparound
+    (two rotations that are nearly identical can have rot_vecs that are far
+    apart), and its raw range (~+-pi) is much wider than embedding/color/
+    translation's, so it would otherwise dominate on both fronts at once.
+    Rotation matrix entries are bounded in [-1, 1], which incidentally also
+    brings it back to a comparable scale to the other components -- equal
+    weights (the default) are a reasonable starting point *because* of that,
+    not despite it.
+    """
+    d = latent_dim
+    emb_p,   emb_t   = pred_flat[..., :d],      target_flat[..., :d]
+    trans_p, trans_t = pred_flat[..., d:d+3],   target_flat[..., d:d+3]
+    rot_p,   rot_t   = pred_flat[..., d+3:d+6], target_flat[..., d+3:d+6]
+    color_p, color_t = pred_flat[..., d+6:d+9], target_flat[..., d+6:d+9]
+
+    w = weights or {}
+    emb_loss   = F.mse_loss(emb_p, emb_t)
+    trans_loss = F.mse_loss(trans_p, trans_t)
+    rot_loss   = F.mse_loss(_rotvec_to_matrix(rot_p), _rotvec_to_matrix(rot_t))
+    color_loss = F.mse_loss(color_p, color_t)
+
+    return (w.get("embedding", 1.0)   * emb_loss +
+            w.get("translation", 1.0) * trans_loss +
+            w.get("rotation", 1.0)    * rot_loss +
+            w.get("color", 1.0)       * color_loss)
 
 
 def _soft_histogram(values: torch.Tensor, weights: torch.Tensor, bin_centers: torch.Tensor, bandwidth: float) -> torch.Tensor:
