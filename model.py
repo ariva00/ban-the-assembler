@@ -263,7 +263,8 @@ class SceneTransformer(nn.Module):
 
 
 class MultiViewTransformer(nn.Module):
-    def __init__(self, latent_dim: int = 256, hidden_dim: int = 512, image_emb_dim: int = 512):
+    def __init__(self, latent_dim: int = 256, hidden_dim: int = 512, image_emb_dim: int = 512,
+                 probe_grid_size: int = 8, probe_bound: float = 1.0):
         super().__init__()
         self.latent_dim = latent_dim
         self.scale = torch.nn.Parameter(torch.tensor((1.,)))
@@ -271,6 +272,16 @@ class MultiViewTransformer(nn.Module):
         self.seed_in  = torch.nn.Linear(latent_dim + 9, hidden_dim)
         self.pose_in  = torch.nn.Linear(6, hidden_dim)
         self.image_in = torch.nn.Linear(image_emb_dim, hidden_dim)
+        self.probe_in = torch.nn.Linear(3, hidden_dim)
+
+        # Fixed grid of 3D query points ("probes") spanning the assumed object-
+        # placement cube ([-1, 1]^3, per render_views.py). A buffer, not a
+        # parameter: positions are fixed, only their projected embedding and
+        # what they attend to is learned.
+        g = probe_grid_size
+        axis = torch.linspace(-probe_bound, probe_bound, g)
+        grid = torch.stack(torch.meshgrid(axis, axis, axis, indexing="ij"), dim=-1).reshape(-1, 3)
+        self.register_buffer("probe_coords", grid)   # (g**3, 3)
 
         self.lin_out = torch.nn.Sequential(
             torch.nn.Linear(hidden_dim, hidden_dim),
@@ -278,15 +289,13 @@ class MultiViewTransformer(nn.Module):
             torch.nn.Linear(hidden_dim, latent_dim + 9),
             torch.nn.Tanh(),
         )
-        # Pure cross-attention, no self-attention among the N seed tokens: a
-        # control test (debug_pretanh.py --no-attention) showed trans/emb only
-        # collapse to identical values across objects when attention is in the
-        # loop — bypassing it entirely preserved (and even grew) per-object
-        # diversity. nn.TransformerDecoderLayer bundles self-attention over the
-        # seeds together with cross-attention to the image context in one block
-        # with no way to disable just the self-attention half, so this uses
-        # transformer.py's Transformer, which only ever does attn(to_q(x), to_k(y),
-        # to_v(y)) — no x-attends-to-x pass.
+
+        # Stage 1: 3D probes gather per-view image content into a latent grid.
+        # Stage 2 (self-attention): probes exchange spatial context with each
+        # other, since stage 1 computes each one independently.
+        # Stage 3: object seed queries cross-attend to that grid.
+        self.probe_transformer = CrossAttentionTransformer(hidden_dim, num_heads=8, num_layers=2)
+        self.latent_self_attn  = CrossAttentionTransformer(hidden_dim, num_heads=8, num_layers=2)
         self.transformer = CrossAttentionTransformer(hidden_dim, num_heads=8, num_layers=2)
 
     def forward(self, seeds: torch.Tensor | list[SceneObject], image_emb: torch.Tensor, image_pose: list[CameraParams]):
@@ -304,11 +313,13 @@ class MultiViewTransformer(nn.Module):
 
         seed_tokens  = self.seed_in(seeds)                             # (N, hidden_dim)
         image_tokens = self.image_in(image_emb) + self.pose_in(pose)   # (n_images, hidden_dim)
+        probe_tokens = self.probe_in(self.probe_coords)                # (P, hidden_dim)
 
-        # cross attention: seeds (query/x) attend to the per-view image context (key-value/y).
         # transformer.py's layers expect a batch dim (batch, seq, embed_dim); these
         # tokens are unbatched (seq, embed_dim), so add/drop a size-1 batch dim.
-        out = self.transformer(seed_tokens.unsqueeze(0), image_tokens.unsqueeze(0)).squeeze(0)
+        latent_tokens = self.probe_transformer(probe_tokens.unsqueeze(0), image_tokens.unsqueeze(0)).squeeze(0)   # (P, hidden_dim)
+        latent_tokens = self.latent_self_attn(latent_tokens.unsqueeze(0), latent_tokens.unsqueeze(0)).squeeze(0)  # (P, hidden_dim)
+        out = self.transformer(seed_tokens.unsqueeze(0), latent_tokens.unsqueeze(0)).squeeze(0)
         out = self.lin_out(out)   # (N, latent_dim + 9), all values in [-1, 1] from Tanh
 
         d = self.latent_dim
