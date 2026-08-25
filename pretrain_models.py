@@ -12,7 +12,7 @@ from model import ShapeEmbedding, NeuralParts, SceneSDF, VisionModel, MultiViewT
 from renderer import SDFRenderer
 from misc import SceneObject, CameraParams
 from dataset import MeshSDFDataset
-from losses import scene_attribute_loss
+from losses import scene_attribute_loss, probe_occupancy_loss
 from utils import CSVLogger
 from tqdm import tqdm
 
@@ -29,7 +29,8 @@ LR_VISION_MODEL    = 1e-3
 LR_MULTIVIEW_TRANSFORMER = 1e-3
 EPOCHS       = 1000
 EPOCHS_VISION_MULTIVIEW = 500   # epoch count for train_vision_multiview()
-SCENES_PER_STEP = 4   # independent scenes averaged into one gradient step
+SCENES_PER_STEP = 16   # independent scenes averaged into one gradient step
+OCCUPANCY_LOSS_WEIGHT = 0.1   # weight on the probe-grid auxiliary occupancy loss
 LR_DECAY_SPLITS = 4   # StepLR halves the LR this many times over the run
 LR_DECAY_GAMMA = 0.5
 CLAMP_DIST   = 0.1
@@ -164,13 +165,13 @@ def train_vision_multiview():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger = CSVLogger(
         f"logs/pretrain_vision_multiview_{timestamp}.csv",
-        columns=["epoch", "loss", "obj", "scale", "lr"],
+        columns=["epoch", "loss", "obj", "scale", "occupancy", "lr"],
     )
 
     def sample_scene_losses():
         """One random scene, rendered from N_VIEWS_MULTIVIEW cameras. Returns
-        (obj_loss, scale_loss), not yet backward()'d, so the caller can
-        accumulate several of these into one averaged gradient step."""
+        (obj_loss, scale_loss, occupancy_loss), not yet backward()'d, so the caller
+        can accumulate several of these into one averaged gradient step."""
         n_obj = torch.randint(1, N_OBJECTS + 1, (1,)).item()
         with torch.no_grad():
             gt_objs = []
@@ -185,6 +186,12 @@ def train_vision_multiview():
             cams = [_random_camera(2.5, 4.0, DEVICE) for _ in range(N_VIEWS_MULTIVIEW)]
             images = torch.stack([renderer(scene_sdf, gt_objs, cam, scale=scale_gt)[0] for cam in cams])   # (V, H, W, 3)
 
+            # Ground-truth occupancy for the transformer's fixed probe grid: union (min)
+            # over objects of the frozen sdf_net's distance channel, same convention the
+            # renderer itself uses (renderer.py's sdfs[..., 0].min(dim=0)).
+            probe_sdf = scene_sdf(multiview_transformer.probe_coords, gt_objs, scale_gt)[..., 0]   # (n_obj, P)
+            occupancy_gt = (probe_sdf.min(dim=0).values < 0).float()                                # (P,)
+
         image_embs = vision_model(images)   # (V, VISION_HIDDEN_DIM)
 
         # ── multiview_transformer: predict objects+scale from image_embs ────────
@@ -192,6 +199,7 @@ def train_vision_multiview():
         output = multiview_transformer(seeds, image_embs, cams)
         pred_objs  = output["objects"]
         pred_scale = output["scale"]
+        pred_occupancy = output["probe_occupancy"]
 
         # ── Combinatorial nearest-neighbor match ────────────────────────────────
         # No positional encoding on the seeds, so predicted object i has no inherent
@@ -210,30 +218,33 @@ def train_vision_multiview():
 
         obj_loss   = scene_attribute_loss(pred_flat, matched_gt_flat, LATENT_DIM)
         scale_loss = F.mse_loss(pred_scale, scale_gt.reshape(pred_scale.shape))
+        occupancy_loss = probe_occupancy_loss(pred_occupancy, occupancy_gt)
 
-        return obj_loss, scale_loss
+        return obj_loss, scale_loss, occupancy_loss
 
     for epoch in tqdm(range(1, EPOCHS_VISION_MULTIVIEW + 1), "Training Vision + MultiView jointly"):
         optimizer.zero_grad()
 
-        obj_total, scale_total = 0.0, 0.0
+        obj_total, scale_total, occupancy_total = 0.0, 0.0, 0.0
         for _ in range(SCENES_PER_STEP):
-            obj_loss, scale_loss = sample_scene_losses()
-            scene_loss = (obj_loss + 0.1 * scale_loss) / SCENES_PER_STEP
+            obj_loss, scale_loss, occupancy_loss = sample_scene_losses()
+            scene_loss = (obj_loss + 0.1 * scale_loss + OCCUPANCY_LOSS_WEIGHT * occupancy_loss) / SCENES_PER_STEP
             scene_loss.backward()
 
-            obj_total   += obj_loss.item() / SCENES_PER_STEP
-            scale_total += scale_loss.item() / SCENES_PER_STEP
+            obj_total       += obj_loss.item() / SCENES_PER_STEP
+            scale_total     += scale_loss.item() / SCENES_PER_STEP
+            occupancy_total += occupancy_loss.item() / SCENES_PER_STEP
 
         optimizer.step()
         scheduler.step()
 
-        loss_total = obj_total + 0.1 * scale_total
-        logger.write([epoch, loss_total, obj_total, scale_total, scheduler.get_last_lr()[0]])
+        loss_total = obj_total + 0.1 * scale_total + OCCUPANCY_LOSS_WEIGHT * occupancy_total
+        logger.write([epoch, loss_total, obj_total, scale_total, occupancy_total, scheduler.get_last_lr()[0]])
 
         if epoch % 10 == 0:
             print(f"Epoch {epoch:4d}/{EPOCHS_VISION_MULTIVIEW}  loss={loss_total:.6f}  "
-                  f"obj={obj_total:.6f}  scale={scale_total:.6f}  lr={scheduler.get_last_lr()[0]:.2e}")
+                  f"obj={obj_total:.6f}  scale={scale_total:.6f}  occupancy={occupancy_total:.6f}  "
+                  f"lr={scheduler.get_last_lr()[0]:.2e}")
 
     torch.save(vision_model.state_dict(), "vision_model.pt")
     torch.save(multiview_transformer.state_dict(), "multiview_transformer.pt")

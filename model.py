@@ -267,7 +267,6 @@ class MultiViewTransformer(nn.Module):
                  probe_grid_size: int = 8, probe_bound: float = 1.0):
         super().__init__()
         self.latent_dim = latent_dim
-        self.scale = torch.nn.Parameter(torch.tensor((1.,)))
 
         self.seed_in  = torch.nn.Linear(latent_dim + 9, hidden_dim)
         self.pose_in  = torch.nn.Linear(6, hidden_dim)
@@ -298,6 +297,25 @@ class MultiViewTransformer(nn.Module):
         self.latent_self_attn  = CrossAttentionTransformer(hidden_dim, num_heads=8, num_layers=2)
         self.transformer = CrossAttentionTransformer(hidden_dim, num_heads=8, num_layers=2)
 
+        # Auxiliary head, not part of the main seed->object path: predicts per-probe
+        # occupancy off latent_tokens so the probe grid is pushed to *contain* spatial
+        # occupancy information (recoverable by a couple of extra layers) without
+        # requiring the tokens themselves to literally be an occupancy encoding.
+        self.occupancy_head = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, hidden_dim // 4),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim // 4, 1),
+        )
+
+        # Scale is a single scene-level scalar, not a per-object one -- mean-pool
+        # self.transformer's per-seed output (grounded in image content, unlike a
+        # bare global parameter) into one scene descriptor before predicting it.
+        self.scale_head = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, hidden_dim // 4),
+            torch.nn.ReLU(),
+            torch.nn.Linear(hidden_dim // 4, 1),
+        )
+
     def forward(self, seeds: torch.Tensor | list[SceneObject], image_emb: torch.Tensor, image_pose: list[CameraParams]):
         """
         seeds:      (N, latent_dim + 9) or list[SceneObject] — object queries to refine
@@ -319,8 +337,10 @@ class MultiViewTransformer(nn.Module):
         # tokens are unbatched (seq, embed_dim), so add/drop a size-1 batch dim.
         latent_tokens = self.probe_transformer(probe_tokens.unsqueeze(0), image_tokens.unsqueeze(0)).squeeze(0)   # (P, hidden_dim)
         latent_tokens = self.latent_self_attn(latent_tokens.unsqueeze(0), latent_tokens.unsqueeze(0)).squeeze(0)  # (P, hidden_dim)
-        out = self.transformer(seed_tokens.unsqueeze(0), latent_tokens.unsqueeze(0)).squeeze(0)
-        out = self.lin_out(out)   # (N, latent_dim + 9), all values in [-1, 1] from Tanh
+        probe_occupancy = self.occupancy_head(latent_tokens).squeeze(-1)   # (P,) occupancy logit per probe
+        seed_out = self.transformer(seed_tokens.unsqueeze(0), latent_tokens.unsqueeze(0)).squeeze(0)   # (N, hidden_dim)
+        scale = F.softplus(self.scale_head(seed_out.mean(dim=0)))   # (1,) one scalar for the whole scene
+        out = self.lin_out(seed_out)   # (N, latent_dim + 9), all values in [-1, 1] from Tanh
 
         d = self.latent_dim
         emb   = out[..., :d]
@@ -330,7 +350,8 @@ class MultiViewTransformer(nn.Module):
         out   = torch.cat([emb, trans, rot, color], dim=-1)
 
         return {
-            "objects" : [SceneObject.inflate(o) for o in out.unbind(0)] if return_as_list else out,
-            "scale"   : F.softplus(self.scale),            # always positive
+            "objects"         : [SceneObject.inflate(o) for o in out.unbind(0)] if return_as_list else out,
+            "scale"           : scale,             # (1,), always positive
+            "probe_occupancy" : probe_occupancy,   # (P,) logits, matches self.probe_coords order
         }
 

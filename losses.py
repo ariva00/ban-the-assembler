@@ -46,6 +46,17 @@ def scene_attribute_loss(
             w.get("color", 1.0)       * color_loss)
 
 
+def probe_occupancy_loss(
+    pred_logits:      torch.Tensor,   # (P,) occupancy logit per probe, from MultiViewTransformer's occupancy_head
+    target_occupancy: torch.Tensor,   # (P,) in {0, 1}, whether the probe point falls inside any ground-truth object
+) -> torch.Tensor:
+    """
+    Only usable where ground-truth object placement is known, i.e. pretraining's
+    synthetic scenes -- not available at real-scene test-time optimization.
+    """
+    return F.binary_cross_entropy_with_logits(pred_logits, target_occupancy)
+
+
 def _soft_histogram(values: torch.Tensor, weights: torch.Tensor, bin_centers: torch.Tensor, bandwidth: float) -> torch.Tensor:
     """
     values:      (P,) flattened per-pixel channel values in [0, 1]
