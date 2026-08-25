@@ -26,7 +26,7 @@ HIDDEN_DIM   = 256
 NUM_LAYERS   = 8
 TRANSFORMER_HIDDEN_DIM = 512   # MultiViewTransformer's internal hidden dim
 EPOCHS = 500
-LR = 1e-3
+LR = 1e-4   # fine-tuning LR for the pretrained checkpoint (well below a from-scratch LR)
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 N_POINTS = 10000
 SAMPLE_BOUND = 3.0   # sampling cube half-extent: points drawn from [-SAMPLE_BOUND, SAMPLE_BOUND]^3
@@ -35,9 +35,12 @@ RENDER_STEPS = 128   # sphere-trace step count
 HIT_EPS = 0.01   # sphere-trace hit threshold
 BACKGROUND_COLOR = torch.tensor([1.0,1.0,1.0], device=DEVICE)
 MASK_THRESHOLD = 0.005   # background isclose tolerance
-VISION_LOSS_WEIGHT = 0.1
-COMMIT_LOSS_WEIGHT = 0.25
+# commitment_loss pulls pred_embs toward a valid codebook value.
+COMMIT_LOSS_WEIGHT_START = 1.0
+COMMIT_LOSS_WEIGHT_END   = 3.0
+COMMIT_LOSS_WEIGHT_RAMP_FRAC = 0.5   # fraction of EPOCHS over which the ramp completes
 FRUSTUM_LOSS_WEIGHT = 0.1
+INTERSECTION_LOSS_WEIGHT = 1.0   # intersection_loss is normalized to a per-point mean below
 MASK_LOSS_WEIGHT = 0.1
 CONNECT_LOSS_WEIGHT = 0.0   # connectivity loss weight (disabled)
 HIST_LOSS_WEIGHT = 0.3   # foreground color-histogram loss weight
@@ -95,7 +98,7 @@ def main():
     sdf_net.load_state_dict(saved_dict["sdf_net"])
     sdf_net.eval()
 
-    vision_model = VisionModel(output_dim=LATENT_DIM + 3 + 3 + 3, hidden_dim=VISION_HIDDEN_DIM).to(DEVICE)
+    vision_model = VisionModel(hidden_dim=VISION_HIDDEN_DIM).to(DEVICE)
     vision_model.load_state_dict(torch.load("vision_model.pt", map_location=DEVICE, weights_only=True))
     vision_model.eval()
     for p in vision_model.parameters():
@@ -119,7 +122,7 @@ def main():
                                   mode="bilinear", align_corners=False, antialias=True).squeeze(1)
 
     with torch.no_grad():
-        target_feats, image_embs = vision_model(targets)   # (V, H, W, out_dim), (V, VISION_HIDDEN_DIM)
+        image_embs = vision_model(targets)   # (V, VISION_HIDDEN_DIM)
 
     d = LATENT_DIM
     seeds = (torch.rand(N_OBJECTS, d + 9, device=DEVICE) * 2) - 1
@@ -138,12 +141,15 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger = CSVLogger(
         f"logs/optimize_scene_multiview_{timestamp}.csv",
-        columns=["epoch", "recon", "vision", "commit", "frustum", "intersec", "connect", "mask", "hist", "scale"],
+        columns=["epoch", "recon", "commit", "frustum", "intersec", "connect", "mask", "hist", "scale", "commit_weight"],
     )
+    ramp_epochs = max(1, int(EPOCHS * COMMIT_LOSS_WEIGHT_RAMP_FRAC))
 
     for epoch in tqdm(range(EPOCHS)):
+        commit_weight = COMMIT_LOSS_WEIGHT_START + min(1.0, epoch / ramp_epochs) * (COMMIT_LOSS_WEIGHT_END - COMMIT_LOSS_WEIGHT_START)
+
         optim.zero_grad()
-        log = dict(recon=0.0, vision=0.0, commit=0.0, frustum=0.0, intersec=0.0, connect=0.0, mask=0.0, hist=0.0)
+        log = dict(recon=0.0, commit=0.0, frustum=0.0, intersec=0.0, connect=0.0, mask=0.0, hist=0.0)
         first_view_pixels = None
         last_scale = None
 
@@ -168,7 +174,7 @@ def main():
             # ── Intersection and connection loss ────────────────────────────────
             points = (torch.rand((N_POINTS, 3)).to(DEVICE) * 2 - 1) * SAMPLE_BOUND
             sdfs = scene_sdf(points, quant_objs, scale)
-            intersection_loss = (torch.nn.functional.softsign(sdfs[..., 0]*(-INTERSECTION_STEEPNESS)).relu().sum(dim=0)-1).relu().sum()
+            intersection_loss = (torch.nn.functional.softsign(sdfs[..., 0]*(-INTERSECTION_STEEPNESS)).relu().sum(dim=0)-1).relu().sum() / N_POINTS
             connect_male = torch.cat((sdfs[..., 1:4], sdfs[..., 7:]), dim=-1).mean(dim=0)
             connect_female = sdfs[..., 4:].mean(dim=0)
             connect_loss = torch.nn.functional.mse_loss(connect_male, connect_female, reduction="mean")
@@ -177,8 +183,6 @@ def main():
             # ── Render + per-view losses ─────────────────────────────────────────
             image, bg_prob, _ = renderer(scene_sdf, quant_objs, cam, scale=scale)
             recon_loss = F.mse_loss(image, targets[v])
-            pred_feat, _ = vision_model(image.unsqueeze(0))
-            vision_loss = F.mse_loss(pred_feat.squeeze(0), target_feats[v])
             # bg_prob = 1 - alpha from renderer: 1 where background, 0 where object
             mask_loss = F.binary_cross_entropy(bg_prob.clamp(1e-6, 1-1e-6), target_masks[v])
             hist_loss = color_histogram_loss(image, 1.0 - bg_prob, targets[v], 1.0 - target_masks[v])
@@ -197,10 +201,9 @@ def main():
 
             view_loss = (
                 recon_loss +
-                VISION_LOSS_WEIGHT * vision_loss +
-                COMMIT_LOSS_WEIGHT * commitment_loss +
+                commit_weight * commitment_loss +
                 FRUSTUM_LOSS_WEIGHT * frustum_loss +
-                intersection_loss +
+                INTERSECTION_LOSS_WEIGHT * intersection_loss +
                 CONNECT_LOSS_WEIGHT * connect_loss +
                 MASK_LOSS_WEIGHT * mask_loss +
                 HIST_LOSS_WEIGHT * hist_loss
@@ -209,7 +212,6 @@ def main():
             view_loss.backward()
 
             log["recon"]    += recon_loss.item() / n_views
-            log["vision"]   += vision_loss.item() / n_views
             log["commit"]   += commitment_loss.item() / n_views
             log["frustum"]  += frustum_loss.item() / n_views
             log["intersec"] += intersection_loss.item() / n_views
@@ -223,9 +225,9 @@ def main():
         obj_codes = [codes[i] for i in nearest_idx.tolist()]
         save_scene_ply(quant_objs, scale, obj_codes, MESH_FOLDER, "output_scene.ply")
         optim.step()
-        logger.write([epoch, log["recon"], log["vision"], log["commit"], log["frustum"],
-                      log["intersec"], log["connect"], log["mask"], log["hist"], last_scale.item()])
-        print(f"\nrec: {log['recon']:.4f} | vision: {log['vision']:.4f} | commit: {log['commit']:.4f} | frustum: {log['frustum']:.4f} | intersec: {log['intersec']:.4f} | connect: {log['connect']:.4f} | mask: {log['mask']:.4f} | hist: {log['hist']:.4f}\nscale: {last_scale.item()}")
+        logger.write([epoch, log["recon"], log["commit"], log["frustum"],
+                      log["intersec"], log["connect"], log["mask"], log["hist"], last_scale.item(), commit_weight])
+        print(f"\nrec: {log['recon']:.4f} | commit: {log['commit']:.4f} | frustum: {log['frustum']:.4f} | intersec: {log['intersec']:.4f} | connect: {log['connect']:.4f} | mask: {log['mask']:.4f} | hist: {log['hist']:.4f} | commit_weight: {commit_weight:.3f}\nscale: {last_scale.item()}")
         Image.fromarray(first_view_pixels).save(f"iterations/{epoch:04d}.png")
 
     # ── Final scene export ──────────────────────────────────────────────────────

@@ -28,8 +28,10 @@ LR_LATENT    = 1e-3
 LR_VISION_MODEL    = 1e-3
 LR_MULTIVIEW_TRANSFORMER = 1e-3
 EPOCHS       = 1000
-EPOCHS_VISION_MULTIVIEW = 3   # epoch count for train_vision_multiview()
+EPOCHS_VISION_MULTIVIEW = 500   # epoch count for train_vision_multiview()
 SCENES_PER_STEP = 4   # independent scenes averaged into one gradient step
+LR_DECAY_SPLITS = 4   # StepLR halves the LR this many times over the run
+LR_DECAY_GAMMA = 0.5
 CLAMP_DIST   = 0.1
 LATENT_REG   = 1e-4
 N_SURFACE    = 100_000 // 4
@@ -144,26 +146,31 @@ def train_vision_multiview():
     renderer = SDFRenderer(n_steps=128, hit_eps=0.01, image_h=RENDER_RES, image_w=RENDER_RES).to(DEVICE)
     scene_sdf = SceneSDF(sdf_net)
 
-    vision_model = VisionModel(output_dim=LATENT_DIM + 3 + 3 + 3, hidden_dim=VISION_HIDDEN_DIM).to(DEVICE)
+    vision_model = VisionModel(hidden_dim=VISION_HIDDEN_DIM).to(DEVICE)
     multiview_transformer = MultiViewTransformer(latent_dim=LATENT_DIM, hidden_dim=512, image_emb_dim=VISION_HIDDEN_DIM).to(DEVICE)
 
     optimizer = torch.optim.Adam([
         {"params": vision_model.parameters(),         "lr": LR_VISION_MODEL},
         {"params": multiview_transformer.parameters(), "lr": LR_MULTIVIEW_TRANSFORMER},
     ])
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer,
+        step_size=max(1, EPOCHS_VISION_MULTIVIEW // LR_DECAY_SPLITS),
+        gamma=LR_DECAY_GAMMA,
+    )
 
     codes = saved_dict["codes"]
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger = CSVLogger(
         f"logs/pretrain_vision_multiview_{timestamp}.csv",
-        columns=["epoch", "loss", "dense", "obj", "scale"],
+        columns=["epoch", "loss", "obj", "scale", "lr"],
     )
 
     def sample_scene_losses():
         """One random scene, rendered from N_VIEWS_MULTIVIEW cameras. Returns
-        (dense_loss, obj_loss, scale_loss), not yet backward()'d, so the caller
-        can accumulate several of these into one averaged gradient step."""
+        (obj_loss, scale_loss), not yet backward()'d, so the caller can
+        accumulate several of these into one averaged gradient step."""
         n_obj = torch.randint(1, N_OBJECTS + 1, (1,)).item()
         with torch.no_grad():
             gt_objs = []
@@ -176,21 +183,9 @@ def train_vision_multiview():
             scale_gt = torch.empty((), device=DEVICE).uniform_(0.5, 1.5)
 
             cams = [_random_camera(2.5, 4.0, DEVICE) for _ in range(N_VIEWS_MULTIVIEW)]
-            renders = [renderer(scene_sdf, gt_objs, cam, scale=scale_gt) for cam in cams]
-            images  = torch.stack([img for img, _, _ in renders])   # (V, H, W, 3)
-            segs    = torch.stack([seg for _, _, seg in renders])   # (V, H, W) -- -1 = background
+            images = torch.stack([renderer(scene_sdf, gt_objs, cam, scale=scale_gt)[0] for cam in cams])   # (V, H, W, 3)
 
-        # ── vision_model forward ────────────────────────────────────────────────
-        pred_dense, image_embs = vision_model(images)   # (V,H,W,out_dim), (V, VISION_HIDDEN_DIM)
-
-        # Per-pixel target: whichever gt object occupies that pixel, or the zero
-        # vector for background. Appended last so segs' background value of -1
-        # selects it via negative indexing.
-        flat_targets = torch.cat([
-            torch.stack([o.flatten() for o in gt_objs]),
-            torch.zeros_like(gt_objs[0].flatten()).unsqueeze(0),
-        ])   # (n_obj + 1, D)
-        dense_loss = scene_attribute_loss(pred_dense, flat_targets[segs], LATENT_DIM)
+        image_embs = vision_model(images)   # (V, VISION_HIDDEN_DIM)
 
         # ── multiview_transformer: predict objects+scale from image_embs ────────
         seeds = [SceneObject.inflate(torch.randn(LATENT_DIM + 9, device=DEVICE)) for _ in range(n_obj)]
@@ -216,29 +211,29 @@ def train_vision_multiview():
         obj_loss   = scene_attribute_loss(pred_flat, matched_gt_flat, LATENT_DIM)
         scale_loss = F.mse_loss(pred_scale, scale_gt.reshape(pred_scale.shape))
 
-        return dense_loss, obj_loss, scale_loss
+        return obj_loss, scale_loss
 
     for epoch in tqdm(range(1, EPOCHS_VISION_MULTIVIEW + 1), "Training Vision + MultiView jointly"):
         optimizer.zero_grad()
 
-        dense_total, obj_total, scale_total = 0.0, 0.0, 0.0
+        obj_total, scale_total = 0.0, 0.0
         for _ in range(SCENES_PER_STEP):
-            dense_loss, obj_loss, scale_loss = sample_scene_losses()
-            scene_loss = (dense_loss + obj_loss + 0.1 * scale_loss) / SCENES_PER_STEP
+            obj_loss, scale_loss = sample_scene_losses()
+            scene_loss = (obj_loss + 0.1 * scale_loss) / SCENES_PER_STEP
             scene_loss.backward()
 
-            dense_total += dense_loss.item() / SCENES_PER_STEP
             obj_total   += obj_loss.item() / SCENES_PER_STEP
             scale_total += scale_loss.item() / SCENES_PER_STEP
 
         optimizer.step()
+        scheduler.step()
 
-        loss_total = dense_total + obj_total + 0.1 * scale_total
-        logger.write([epoch, loss_total, dense_total, obj_total, scale_total])
+        loss_total = obj_total + 0.1 * scale_total
+        logger.write([epoch, loss_total, obj_total, scale_total, scheduler.get_last_lr()[0]])
 
         if epoch % 10 == 0:
             print(f"Epoch {epoch:4d}/{EPOCHS_VISION_MULTIVIEW}  loss={loss_total:.6f}  "
-                  f"dense={dense_total:.6f}  obj={obj_total:.6f}  scale={scale_total:.6f}")
+                  f"obj={obj_total:.6f}  scale={scale_total:.6f}  lr={scheduler.get_last_lr()[0]:.2e}")
 
     torch.save(vision_model.state_dict(), "vision_model.pt")
     torch.save(multiview_transformer.state_dict(), "multiview_transformer.pt")
